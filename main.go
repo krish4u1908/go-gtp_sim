@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"flag"
@@ -12,7 +11,6 @@ import (
 	"time"
 
 	gtp "github.com/wmnsk/go-gtp"
-
 	gtpv2 "github.com/wmnsk/go-gtp/gtpv2"
 	gtpv2ie "github.com/wmnsk/go-gtp/gtpv2/ie"
 	gtpv2msg "github.com/wmnsk/go-gtp/gtpv2/message"
@@ -36,9 +34,10 @@ type cfg struct {
 func main() {
 	var c cfg
 	var ratU, ebiU uint
+
 	nodeIP := flag.String("node-ip", "127.0.0.1", "SGW IP to put inside F-TEID (IPv4)")
-	flag.StringVar(&c.local, "local", "0.0.0.0:0", "local bind ip:port (0=ephemeral)")
-	flag.StringVar(&c.remote, "remote", "", "PGW ip:port (e.g. 10.10.10.20:2123)")
+	flag.StringVar(&c.local, "local", "0.0.0.0:2123", "local bind ip:port")
+	flag.StringVar(&c.remote, "remote", "", "PGW ip:port (e.g. 172.16.10.170:2123)")
 	flag.StringVar(&c.imsi, "imsi", "001010123456789", "IMSI")
 	flag.StringVar(&c.msisdn, "msisdn", "919999999999", "MSISDN (optional)")
 	flag.StringVar(&c.apn, "apn", "internet", "APN")
@@ -46,7 +45,7 @@ func main() {
 	flag.UintVar(&ratU, "rat", 6, "RAT-Type (e.g. 6=EUTRAN)")
 	flag.UintVar(&ebiU, "ebi", 5, "EPS Bearer ID (default bearer usually 5)")
 	flag.DurationVar(&c.echoEvery, "echo", 10*time.Second, "send Echo Request every duration")
-	flag.DurationVar(&c.timeout, "timeout", 3*time.Second, "wait timeout for CSRsp")
+	flag.DurationVar(&c.timeout, "timeout", 5*time.Second, "wait timeout for CSRsp")
 	flag.Parse()
 
 	if c.remote == "" {
@@ -72,61 +71,27 @@ func main() {
 		log.Fatalf("resolve remote: %v", err)
 	}
 
-	// S5/S8 SGW GTP-C interface conn
-	conn := gtpv2.NewConn(laddr, gtpv2.IFTypeS5S8SGWGTPC, 0)
+	udpConn, err := net.ListenUDP("udp", laddr)
+	if err != nil {
+		log.Fatalf("listen udp: %v", err)
+	}
+	defer udpConn.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	log.Printf("S5/S8 SGW initiator up: local=%s remote=%s node-ip=%s", udpConn.LocalAddr(), raddr, c.nodeIP)
 
-	// Channel to receive CSRsp for our seq
-	csRspCh := make(chan *gtpv2msg.CreateSessionResponse, 1)
+	// Channel to deliver CSRsp back to sender (match by seq).
+	csRspCh := make(chan *gtpv2msg.CreateSessionResponse, 8)
 
-	// Handle Echo Request -> Echo Response
-	conn.AddHandler(gtpv2msg.MsgTypeEchoRequest, func(cn *gtpv2.Conn, sender net.Addr, msg gtpv2msg.Message) error {
-		er := msg.(*gtpv2msg.EchoRequest)
+	// RX loop: respond EchoReq, forward CSRsp to channel, log others.
+	go rxLoop(udpConn, csRspCh)
 
-		// NewEchoResponse(teid, ies...)  (NO seq param in this go-gtp version)
-		resp := gtpv2msg.NewEchoResponse(0, gtpv2ie.NewRecovery(1))
-		resp.SetSequenceNumber(er.Sequence())
-
-		b, err := gtp.Marshal(resp)
-		if err != nil {
-			log.Printf("echo resp marshal err: %v", err)
-			return nil
-		}
-		_, _ = cn.WriteTo(b, sender)
-		log.Printf("rx EchoReq from %s -> EchoResp (seq=%d)", sender.String(), er.Sequence())
-		return nil
-	})
-
-	// Capture Create Session Response
-	conn.AddHandler(gtpv2msg.MsgTypeCreateSessionResponse, func(cn *gtpv2.Conn, sender net.Addr, msg gtpv2msg.Message) error {
-		resp := msg.(*gtpv2msg.CreateSessionResponse)
-		select {
-		case csRspCh <- resp:
-		default:
-		}
-		log.Printf("rx CSRsp from %s teid=0x%08x seq=%d", sender.String(), resp.TEID(), resp.Sequence())
-		return nil
-	})
-
-	// Start RX loop
-	go func() {
-		if err := conn.ListenAndServe(ctx); err != nil {
-			log.Printf("ListenAndServe stopped: %v", err)
-		}
-	}()
-
-	log.Printf("S5/S8 SGW initiator up: local=%s remote=%s node-ip=%s", laddr, raddr, c.nodeIP)
-
-	// Periodic Echo Requests (keepalive)
+	// Periodic Echo Requests
 	go func() {
 		t := time.NewTicker(c.echoEvery)
 		defer t.Stop()
 		for range t.C {
 			seq := uint32(time.Now().UnixNano() & 0x00ffffff)
 
-			// NewEchoRequest(teid, ies...)  (NO seq param)
 			req := gtpv2msg.NewEchoRequest(0, gtpv2ie.NewRecovery(1))
 			req.SetSequenceNumber(seq)
 
@@ -135,30 +100,79 @@ func main() {
 				log.Printf("echo req marshal err: %v", err)
 				continue
 			}
-			_, _ = conn.WriteTo(b, raddr)
+			_, _ = udpConn.WriteToUDP(b, raddr)
 			log.Printf("tx EchoReq seq=%d -> %s", seq, raddr.String())
 		}
 	}()
 
-	// Trigger one Create Session Request
-	if err := sendCreateSession(conn, raddr, c, csRspCh); err != nil {
+	// Trigger Create Session
+	if err := sendCreateSession(udpConn, raddr, c, csRspCh); err != nil {
 		log.Fatalf("CreateSession failed: %v", err)
 	}
 
 	select {} // keep alive
 }
-func sendCreateSession(conn *gtpv2.Conn, raddr net.Addr, c cfg, csRspCh <-chan *gtpv2msg.CreateSessionResponse) error {
+
+func rxLoop(udpConn *net.UDPConn, csRspCh chan<- *gtpv2msg.CreateSessionResponse) {
+	buf := make([]byte, 8192)
+	for {
+		n, peer, err := udpConn.ReadFromUDP(buf)
+		if err != nil {
+			log.Printf("rx err: %v", err)
+			continue
+		}
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+
+		// Parse any GTP message
+		m, err := gtp.Parse(pkt)
+		if err != nil {
+			continue
+		}
+
+		v2m, ok := m.(gtpv2msg.Message)
+		if !ok {
+			continue
+		}
+
+		switch v2m.MessageType() {
+		case gtpv2msg.MsgTypeEchoRequest:
+			er := v2m.(*gtpv2msg.EchoRequest)
+			resp := gtpv2msg.NewEchoResponse(0, gtpv2ie.NewRecovery(1))
+			resp.SetSequenceNumber(er.Sequence())
+			b, err := gtp.Marshal(resp)
+			if err == nil {
+				_, _ = udpConn.WriteToUDP(b, peer)
+			}
+			log.Printf("rx EchoReq from %s -> EchoResp (seq=%d)", peer.String(), er.Sequence())
+
+		case gtpv2msg.MsgTypeEchoResponse:
+			log.Printf("rx EchoResp from %s seq=%d", peer.String(), v2m.Sequence())
+
+		case gtpv2msg.MsgTypeCreateSessionResponse:
+			resp := v2m.(*gtpv2msg.CreateSessionResponse)
+			select {
+			case csRspCh <- resp:
+			default:
+			}
+			log.Printf("rx CSRsp from %s teid=0x%08x seq=%d", peer.String(), resp.TEID(), resp.Sequence())
+
+		default:
+			log.Printf("rx msgType=%d from %s teid=0x%08x seq=%d", v2m.MessageType(), peer.String(), v2m.TEID(), v2m.Sequence())
+		}
+	}
+}
+
+func sendCreateSession(udpConn *net.UDPConn, raddr *net.UDPAddr, c cfg, csRspCh <-chan *gtpv2msg.CreateSessionResponse) error {
 	seq := uint32(time.Now().UnixNano() & 0x00ffffff)
 
 	// Sender F-TEID for CP (S5/S8 SGW GTP-C)
 	localCTeid := randUint32()
-
-	// Your go-gtp expects IPv4/IPv6 as strings here
 	senderFTEID := gtpv2ie.NewFullyQualifiedTEID(
 		gtpv2.IFTypeS5S8SGWGTPC,
 		localCTeid,
-		c.nodeIP.String(), // v4 string
-		"",                // v6 string
+		c.nodeIP.String(), // v4
+		"",                // v6
 	)
 	senderFTEID.SetInstance(0)
 
@@ -173,14 +187,13 @@ func sendCreateSession(conn *gtpv2.Conn, raddr net.Addr, c cfg, csRspCh <-chan *
 		pdnVal = 1
 	}
 
-	// Minimal bearer context: EBI + BearerQoS (tune for your PGW expectations)
+	// Bearer Context (to be created) — instance 0
 	bearerQoS := gtpv2ie.NewBearerQoS(0, 9, 0, 9, 0, 0, 0, 0)
-
 	bearerCtx := gtpv2ie.NewBearerContext(
 		gtpv2ie.NewEPSBearerID(c.ebi),
 		bearerQoS,
 	)
-	bearerCtx.SetInstance(0) // "to be created"
+	bearerCtx.SetInstance(0)
 
 	ies := []*gtpv2ie.IE{
 		gtpv2ie.NewIMSI(c.imsi),
@@ -194,7 +207,7 @@ func sendCreateSession(conn *gtpv2.Conn, raddr net.Addr, c cfg, csRspCh <-chan *
 		ies = append(ies, gtpv2ie.NewMSISDN(c.msisdn))
 	}
 
-	// In your version: NewCreateSessionRequest(teid, seq, ies...)
+	// Your version requires (teid, seq, ies...)
 	req := gtpv2msg.NewCreateSessionRequest(0, seq, ies...)
 
 	b, err := gtp.Marshal(req)
@@ -202,24 +215,30 @@ func sendCreateSession(conn *gtpv2.Conn, raddr net.Addr, c cfg, csRspCh <-chan *
 		return fmt.Errorf("marshal csr: %w", err)
 	}
 
-	if _, err := conn.WriteTo(b, raddr); err != nil {
+	if _, err := udpConn.WriteToUDP(b, raddr); err != nil {
 		return fmt.Errorf("send csr: %w", err)
 	}
 	log.Printf("tx CSR seq=%d localCTeid=0x%08x -> %s", seq, localCTeid, raddr.String())
 
-	// Wait for CSRsp (best-effort)
-	select {
-	case resp := <-csRspCh:
-		if resp.Sequence() != seq {
-			log.Printf("got CSRsp but seq mismatch: want=%d got=%d", seq, resp.Sequence())
+	// Wait for matching CSRsp
+	deadline := time.NewTimer(c.timeout)
+	defer deadline.Stop()
+
+	for {
+		select {
+		case resp := <-csRspCh:
+			if resp.Sequence() != seq {
+				// ignore unrelated responses
+				continue
+			}
+			log.Printf("CSR succeeded seq=%d (resp teid=0x%08x). Next: DeleteSession / ModifyBearer.", seq, resp.TEID())
 			return nil
+		case <-deadline.C:
+			return fmt.Errorf("timeout waiting CSRsp (seq=%d)", seq)
 		}
-		log.Printf("CSR succeeded (seq=%d). Extend next: Delete Session / Modify Bearer.", seq)
-		return nil
-	case <-time.After(c.timeout):
-		return fmt.Errorf("timeout waiting CSRsp (seq=%d)", seq)
 	}
 }
+
 func randUint32() uint32 {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
